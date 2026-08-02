@@ -1,0 +1,163 @@
+#omni-voice-trigger { display: none !important; }
+
+#godplan-global-voice-presence {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    z-index: 11950;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 44px;
+    height: 42px;
+    padding: 0 11px 0 7px;
+    border: 1px solid rgba(41, 126, 153, 0.2);
+    border-radius: 999px;
+    color: #567586;
+    background: rgba(250, 254, 255, 0.8);
+    box-shadow: 0 8px 28px rgba(20, 78, 99, 0.11);
+    backdrop-filter: blur(16px);
+    cursor: pointer;
+    opacity: 0.68;
+    transition: opacity 180ms ease, transform 180ms ease, border-color 180ms ease, background 180ms ease;
+}
+
+#godplan-global-voice-presence:hover,
+#godplan-global-voice-presence:focus-visible { opacity: 1; transform: translateY(-2px); }
+
+.godplan-presence-core {
+    position: relative;
+    display: grid;
+    width: 27px;
+    height: 27px;
+    place-items: center;
+    border-radius: 50%;
+    background: conic-gradient(from 200deg, #33c8d6, #227da2, #6be0cf, #33c8d6);
+    box-shadow: inset 0 0 0 4px rgba(255,255,255,.72), 0 0 0 1px rgba(17, 126, 157, .12);
+}
+
+.godplan-presence-core::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #f8ffff;
+    box-shadow: 0 0 10px rgba(147, 255, 247, .95);
+}
+
+.godplan-presence-core i {
+    position: absolute;
+    inset: -4px;
+    border: 1px solid rgba(45, 177, 198, .26);
+    border-radius: 50%;
+}
+
+.godplan-presence-label { font-size: 9px; font-weight: 900; letter-spacing: .12em; }
+
+#godplan-global-voice-presence[data-state="ready"] { opacity: .78; border-color: rgba(32, 170, 186, .3); }
+#godplan-global-voice-presence[data-state="listening"],
+#godplan-global-voice-presence[data-state="processing"],
+#godplan-global-voice-presence[data-state="speaking"] { opacity: 1; color: #16627c; background: rgba(240, 253, 255, .96); }
+#godplan-global-voice-presence[data-state="listening"] .godplan-presence-core i,
+#godplan-global-voice-presence[data-state="processing"] .godplan-presence-core i,
+#godplan-global-voice-presence[data-state="speaking"] .godplan-presence-core i { animation: godplan-presence-pulse 1.35s ease-out infinite; }
+#godplan-global-voice-presence[data-state="error"] { border-color: rgba(198, 88, 88, .32); color: #9d4747; }
+
+#godplan-wake-overlay[hidden] { display: none !important; }
+
+#godplan-wake-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 12000;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    pointer-events: none;
+}
+
+.godplan-wake-backdrop {
+    position: absolute;
+    inset: 0;
+    background:
+        radial-gradient(circle at 50% 54%, rgba(70, 221, 222, .18), transparent 32%),
+        linear-gradient(180deg, rgba(230, 250, 253, .12), rgba(7, 45, 63, .18));
+    backdrop-filter: blur(4px) saturate(1.08);
+    animation: godplan-backdrop-in 240ms ease both;
+}
+
+.godplan-wake-card {
+    position: relative;
+    display: grid;
+    width: min(440px, calc(100vw - 40px));
+    justify-items: center;
+    gap: 20px;
+    padding: 30px 28px 27px;
+    border: 1px solid rgba(150, 237, 239, .46);
+    border-radius: 30px;
+    color: #eaffff;
+    background: linear-gradient(145deg, rgba(11, 63, 82, .93), rgba(10, 40, 60, .95));
+    box-shadow: 0 28px 90px rgba(3, 35, 50, .34), inset 0 1px 0 rgba(255,255,255,.12);
+    text-align: center;
+    overflow: hidden;
+    animation: godplan-card-in 280ms cubic-bezier(.2,.8,.2,1) both;
+}
+
+.godplan-wake-card::after {
+    content: '';
+    position: absolute;
+    inset: -50% -20%;
+    background: linear-gradient(105deg, transparent 40%, rgba(117, 255, 246, .12), transparent 60%);
+    animation: godplan-scan 2.8s linear infinite;
+}
+
+.godplan-wake-visual { position: relative; width: 104px; height: 104px; }
+.godplan-wake-ring,
+.godplan-wake-orb { position: absolute; border-radius: 50%; }
+.godplan-wake-ring { inset: 0; border: 1px solid rgba(100, 242, 237, .48); }
+.godplan-wake-ring.ring-one { animation: godplan-ring 1.8s ease-out infinite; }
+.godplan-wake-ring.ring-two { inset: 13px; animation: godplan-ring 1.8s .42s ease-out infinite; }
+.godplan-wake-orb {
+    inset: 27px;
+    background: radial-gradient(circle at 35% 30%, #e9ffff 0 8%, #65e2df 24%, #1689a9 62%, #0c4867 100%);
+    box-shadow: 0 0 25px rgba(79, 231, 224, .7), 0 0 60px rgba(25, 157, 189, .34);
+}
+
+.godplan-wake-copy { position: relative; z-index: 1; display: grid; gap: 7px; }
+.godplan-wake-kicker { color: #85e9e7; font-size: 10px; font-weight: 900; letter-spacing: .18em; }
+.godplan-wake-copy strong { font-size: clamp(23px, 4vw, 31px); letter-spacing: -.04em; }
+.godplan-wake-copy p {
+    min-height: 22px;
+    margin: 0;
+    color: rgba(225, 249, 251, .76);
+    font-size: 14px;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+    transition: opacity .16s ease, transform .16s ease;
+}
+
+#godplan-wake-overlay[data-phase="listening"] .godplan-wake-copy p { animation: godplan-transcript-settle .22s ease-out; }
+#godplan-wake-transcript { display: none !important; }
+
+#godplan-wake-overlay[data-phase="processing"] .godplan-wake-orb { animation: godplan-orb-think .8s ease-in-out infinite alternate; }
+#godplan-wake-overlay[data-phase="answer"] .godplan-wake-card { border-color: rgba(122, 247, 199, .55); }
+#godplan-wake-overlay[data-phase="error"] .godplan-wake-card { border-color: rgba(255, 163, 163, .44); }
+
+@keyframes godplan-presence-pulse { from { opacity: .75; transform: scale(.8); } to { opacity: 0; transform: scale(1.55); } }
+@keyframes godplan-backdrop-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes godplan-card-in { from { opacity: 0; transform: translateY(12px) scale(.94); } to { opacity: 1; transform: none; } }
+@keyframes godplan-ring { from { opacity: .8; transform: scale(.72); } to { opacity: 0; transform: scale(1.25); } }
+@keyframes godplan-orb-think { from { transform: scale(.92); filter: hue-rotate(0deg); } to { transform: scale(1.08); filter: hue-rotate(22deg); } }
+@keyframes godplan-transcript-settle { from { opacity: .58; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+@keyframes godplan-scan { from { transform: translateX(-35%); } to { transform: translateX(35%); } }
+
+@media (max-width: 640px) {
+    #godplan-global-voice-presence { right: 12px; bottom: 12px; }
+    .godplan-presence-label { display: none; }
+    #godplan-global-voice-presence { width: 42px; padding: 0; justify-content: center; }
+    .godplan-wake-card { padding: 25px 20px 23px; border-radius: 25px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #godplan-global-voice-presence *,
+    #godplan-wake-overlay * { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
