@@ -136,7 +136,14 @@
 }
 
 #godplan-wake-overlay[data-phase="listening"] .godplan-wake-copy p { animation: godplan-transcript-settle .22s ease-out; }
-#godplan-wake-transcript { display: none !important; }
+#godplan-wake-transcript {
+    display: block;
+    width: min(360px, calc(100vw - 88px));
+    max-height: 7.75em;
+    white-space: pre-wrap;
+    overflow: hidden;
+}
+#godplan-wake-transcript[hidden] { display: none !important; }
 
 #godplan-wake-overlay[data-phase="processing"] .godplan-wake-orb { animation: godplan-orb-think .8s ease-in-out infinite alternate; }
 #godplan-wake-overlay[data-phase="answer"] .godplan-wake-card { border-color: rgba(122, 247, 199, .55); }

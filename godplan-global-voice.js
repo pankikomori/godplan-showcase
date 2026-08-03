@@ -6,13 +6,25 @@
 
     const PREFERENCE_KEY = 'godplan_global_voice_enabled_v1';
     const AUTO_ENABLE_KEY = 'godplan_global_voice_auto_enabled_v2';
+    const COMMAND_IDLE_TIMEOUT_MS = 12000;
+    const CONTINUATION_IDLE_TIMEOUT_MS = 10000;
+    const ACTIVE_SPEECH_IDLE_TIMEOUT_MS = 8000;
+    const RECOGNITION_START_TIMEOUT_MS = 10000;
+    const RECOGNITION_RETRY_BASE_MS = 350;
+    const RECOGNITION_RETRY_MAX_MS = 5000;
+    const MAX_RECOGNITION_FAILURES = 3;
+    const SPEECH_WATCHDOG_MIN_MS = 2500;
+    const SPEECH_WATCHDOG_MAX_MS = 15000;
     const state = {
         enabled: false,
         recognition: null,
         restartTimer: 0,
+        recognitionStartTimer: 0,
         followupTimer: 0,
         interimTimer: 0,
         overlayTimer: 0,
+        speechTimer: 0,
+        speechToken: 0,
         awaitingCommand: false,
         speaking: false,
         voiceRequestPending: false,
@@ -30,7 +42,10 @@
         wakeFragment: '',
         wakeFragmentAt: 0,
         openOnRecognitionStart: false,
-        requestExecutionMode: 'direct'
+        requestExecutionMode: 'direct',
+        listeningTimeoutMs: COMMAND_IDLE_TIMEOUT_MS,
+        recognitionFailureCount: 0,
+        lastRecognitionError: ''
     };
 
     function normalizeText(value) {
@@ -199,7 +214,7 @@
             activateWake();
         });
         document.addEventListener('keydown', (event) => {
-            if (event.key === 'Escape' && !overlay.hidden) hideOverlay();
+            if (event.key === 'Escape' && !overlay.hidden) cancelListeningSession({ silent: true });
         });
         return { presence, overlay };
     }
@@ -229,27 +244,39 @@
         overlay.dataset.phase = phase;
         const titleElement = document.getElementById('godplan-wake-title');
         const transcriptElement = document.getElementById('godplan-wake-transcript');
-        if (titleElement) titleElement.textContent = phaseTitles[phase] || title;
+        if (titleElement) titleElement.textContent = normalizeText(title) || phaseTitles[phase] || '헤이 갓플';
         if (transcriptElement) {
-            transcriptElement.textContent = '';
-            transcriptElement.hidden = true;
+            const visibleTranscript = normalizeText(transcript);
+            transcriptElement.textContent = visibleTranscript;
+            transcriptElement.hidden = !visibleTranscript;
         }
         if (options.hideAfter) state.overlayTimer = window.setTimeout(hideOverlay, options.hideAfter);
     }
 
     function hideOverlay() {
+        window.clearTimeout(state.overlayTimer);
+        state.overlayTimer = 0;
         const overlay = document.getElementById('godplan-wake-overlay');
         if (overlay) overlay.hidden = true;
     }
 
     function stopRecognition(options = {}) {
         window.clearTimeout(state.restartTimer);
+        window.clearTimeout(state.recognitionStartTimer);
+        state.restartTimer = 0;
+        state.recognitionStartTimer = 0;
         const recognition = state.recognition;
         state.recognition = null;
         if (!options.preserveEnabled) state.enabled = false;
         if (recognition) {
+            recognition.onstart = null;
+            recognition.onspeechstart = null;
+            recognition.onresult = null;
+            recognition.onerror = null;
             recognition.onend = null;
-            try { recognition.stop(); } catch {}
+            try { recognition.abort(); } catch {
+                try { recognition.stop(); } catch {}
+            }
         }
     }
 
@@ -267,34 +294,62 @@
         return voices.sort((left, right) => score(right) - score(left))[0] || null;
     }
 
+    function resumeAfterSpeech(options = {}) {
+        state.speaking = false;
+        if (!options.keepAwaiting) state.awaitingCommand = false;
+        if (state.awaitingCommand) armFollowupTimeout(state.listeningTimeoutMs);
+        if (state.enabled && options.resume !== false) restartRecognition(0);
+        setPresence(
+            state.awaitingCommand ? 'listening' : state.enabled ? 'ready' : 'off',
+            state.awaitingCommand ? '헤이 갓플이 듣고 있습니다' : state.enabled ? '헤이 갓플 호출 대기 중' : '헤이 갓플 음성 호출 켜기'
+        );
+    }
+
+    function stopSpeech() {
+        window.clearTimeout(state.speechTimer);
+        state.speechTimer = 0;
+        state.speechToken += 1;
+        state.speaking = false;
+        try { window.speechSynthesis?.cancel(); } catch {}
+    }
+
     function speak(text, options = {}) {
         const message = normalizeText(text).slice(0, 320);
-        if (!message || !('speechSynthesis' in window)) {
-            if (options.resume !== false) restartRecognition();
+        if (!message || !('speechSynthesis' in window) || typeof window.SpeechSynthesisUtterance === 'undefined') {
+            resumeAfterSpeech(options);
             return;
         }
-        window.speechSynthesis.cancel();
+        stopSpeech();
         stopRecognition({ preserveEnabled: true });
+        window.clearTimeout(state.followupTimer);
         state.speaking = true;
         setPresence('speaking', '헤이 갓플이 응답하고 있습니다');
-        const utterance = new SpeechSynthesisUtterance(message);
+        const speechToken = ++state.speechToken;
+        const utterance = new window.SpeechSynthesisUtterance(message);
         utterance.lang = 'ko-KR';
         utterance.rate = options.rate || 1;
         utterance.pitch = options.pitch || 0.96;
         utterance.volume = 1;
         utterance.voice = chooseKoreanVoice();
+        let completed = false;
         const finish = () => {
-            state.speaking = false;
-            if (!options.keepAwaiting) state.awaitingCommand = false;
-            if (state.enabled && options.resume !== false) restartRecognition();
-            setPresence(
-                options.keepAwaiting ? 'listening' : state.enabled ? 'ready' : 'off',
-                options.keepAwaiting ? '헤이 갓플이 듣고 있습니다' : state.enabled ? '헤이 갓플 호출 대기 중' : '헤이 갓플 음성 호출 켜기'
-            );
+            if (completed || speechToken !== state.speechToken) return;
+            completed = true;
+            window.clearTimeout(state.speechTimer);
+            state.speechTimer = 0;
+            resumeAfterSpeech(options);
         };
         utterance.onend = finish;
         utterance.onerror = finish;
-        window.speechSynthesis.speak(utterance);
+        const estimatedDuration = Math.round(message.length * 90 / Math.max(0.75, utterance.rate)) + 1800;
+        const watchdogDelay = Math.min(SPEECH_WATCHDOG_MAX_MS, Math.max(SPEECH_WATCHDOG_MIN_MS, estimatedDuration));
+        state.speechTimer = window.setTimeout(finish, watchdogDelay);
+        try {
+            window.speechSynthesis.resume?.();
+            window.speechSynthesis.speak(utterance);
+        } catch {
+            finish();
+        }
     }
 
     function resetCommandBuffer() {
@@ -310,19 +365,34 @@
         return mergeTranscriptText(confirmed, state.commandInterim);
     }
 
-    function armFollowupTimeout(delay = 12000) {
+    function cancelListeningSession(options = {}) {
         window.clearTimeout(state.followupTimer);
-        state.followupTimer = window.setTimeout(() => {
-            const bufferedCommand = getBufferedCommand();
-            if (bufferedCommand) {
-                executeVoiceCommand(bufferedCommand);
-                return;
-            }
-            state.awaitingCommand = false;
-            resetCommandBuffer();
-            hideOverlay();
-            setPresence(state.enabled ? 'ready' : 'off', state.enabled ? '헤이 갓플 호출 대기 중' : '헤이 갓플 음성 호출 켜기');
-        }, delay);
+        window.clearTimeout(state.interimTimer);
+        state.followupTimer = 0;
+        state.interimTimer = 0;
+        if (options.stopSpeaking !== false && state.speaking) stopSpeech();
+        state.awaitingCommand = false;
+        resetCommandBuffer();
+        if (options.silent) hideOverlay();
+        setPresence(state.enabled ? 'ready' : 'off', state.enabled ? '헤이 갓플 호출 대기 중' : '헤이 갓플 음성 호출 켜기');
+        if (state.enabled && !state.recognition && document.visibilityState === 'visible') restartRecognition(0);
+    }
+
+    function recoverListeningTimeout() {
+        if (!state.awaitingCommand) return;
+        const bufferedCommand = getBufferedCommand();
+        if (bufferedCommand) {
+            executeVoiceCommand(bufferedCommand);
+            return;
+        }
+        cancelListeningSession({ silent: true, stopSpeaking: false });
+        showOverlay('error', '음성을 듣지 못했어요', '작은 HEY 버튼을 누르고 다시 말씀해 주세요.', { hideAfter: 3600 });
+    }
+
+    function armFollowupTimeout(delay = COMMAND_IDLE_TIMEOUT_MS) {
+        window.clearTimeout(state.followupTimer);
+        if (!state.awaitingCommand) return;
+        state.followupTimer = window.setTimeout(recoverListeningTimeout, delay);
     }
 
     function playWakeTone() {
@@ -351,7 +421,8 @@
         resetCommandBuffer();
         state.awaitingCommand = true;
         state.dictationStartedAt = Date.now();
-        armFollowupTimeout(125000);
+        state.listeningTimeoutMs = COMMAND_IDLE_TIMEOUT_MS;
+        armFollowupTimeout(state.listeningTimeoutMs);
         setPresence('listening', '헤이 갓플이 긴 요청을 듣고 있습니다');
     }
 
@@ -359,7 +430,8 @@
         resetCommandBuffer();
         state.awaitingCommand = true;
         state.dictationStartedAt = Date.now();
-        armFollowupTimeout(30000);
+        state.listeningTimeoutMs = CONTINUATION_IDLE_TIMEOUT_MS;
+        armFollowupTimeout(state.listeningTimeoutMs);
         setPresence('listening', '헤이 갓플이 후속 요청을 기다리고 있습니다');
     }
 
@@ -390,6 +462,7 @@
             showOverlay('listening', isFinal ? '잠시 멈추면 바로 처리할게요' : '계속 듣고 있어요', bufferedCommand.slice(-500));
         }
         setPresence('listening', `헤이 갓플이 요청을 듣고 있습니다 · ${bufferedCommand.length}자`);
+        armFollowupTimeout(ACTIVE_SPEECH_IDLE_TIMEOUT_MS);
 
         const elapsed = Date.now() - state.dictationStartedAt;
         if (elapsed >= 120000) {
@@ -409,7 +482,15 @@
             .replace(/^\s*(?:음+|어+|저기|그러니까|있잖아|내\s*말은|부탁인데)[,\s]*/u, '')
             .trim();
         const now = Date.now();
-        if (!normalizedCommand || normalizedCommand === state.lastExecutedCommand && now - state.lastExecutedAt < 3500) return;
+        if (!normalizedCommand) {
+            recoverListeningTimeout();
+            return;
+        }
+        if (normalizedCommand === state.lastExecutedCommand && now - state.lastExecutedAt < 3500) {
+            cancelListeningSession({ silent: true });
+            showOverlay('answer', '이미 처리하고 있어요', normalizedCommand, { hideAfter: 2600 });
+            return;
+        }
         state.lastExecutedCommand = normalizedCommand;
         state.lastExecutedAt = now;
         const requestPolicy = classifyVoiceRequest(normalizedCommand);
@@ -502,6 +583,41 @@
         activateWake();
     }
 
+    function disableVoiceRuntimeWithError(title, message, options = {}) {
+        state.enabled = false;
+        state.openOnRecognitionStart = false;
+        localStorage.setItem(PREFERENCE_KEY, 'false');
+        stopRecognition({ preserveEnabled: true });
+        stopSpeech();
+        window.clearTimeout(state.followupTimer);
+        window.clearTimeout(state.interimTimer);
+        state.awaitingCommand = false;
+        resetCommandBuffer();
+        setPresence(options.unsupported ? 'unsupported' : 'error', message);
+        showOverlay('error', title, message, { hideAfter: options.hideAfter || 6500 });
+    }
+
+    function markTransientRecognitionFailure(error) {
+        state.lastRecognitionError = error || 'unknown';
+        state.recognitionFailureCount += 1;
+        state.restartDelay = Math.min(
+            RECOGNITION_RETRY_MAX_MS,
+            RECOGNITION_RETRY_BASE_MS * (2 ** Math.max(0, state.recognitionFailureCount - 1))
+        );
+        if (state.recognitionFailureCount >= MAX_RECOGNITION_FAILURES) {
+            disableVoiceRuntimeWithError(
+                '음성 연결을 멈췄어요',
+                '마이크 상태를 확인한 뒤 작은 HEY 버튼을 눌러 다시 연결해 주세요.'
+            );
+            return false;
+        }
+        setPresence('error', '음성 인식을 다시 연결하고 있습니다');
+        if (state.awaitingCommand) {
+            showOverlay('connecting', '마이크를 다시 연결하고 있어요', '말씀하신 내용은 유지하고 있습니다.');
+        }
+        return true;
+    }
+
     function createRecognition() {
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (!SpeechRecognition) return null;
@@ -511,6 +627,8 @@
         recognition.interimResults = true;
         recognition.maxAlternatives = 10;
         recognition.onstart = () => {
+            window.clearTimeout(state.recognitionStartTimer);
+            state.recognitionStartTimer = 0;
             state.restartDelay = 0;
             setPresence(
                 state.awaitingCommand ? 'listening' : 'ready',
@@ -521,8 +639,17 @@
                 window.setTimeout(activateWake, 0);
             }
         };
-        recognition.onspeechstart = () => { state.restartDelay = 0; };
+        recognition.onspeechstart = () => {
+            state.restartDelay = 0;
+            state.recognitionFailureCount = 0;
+            state.lastRecognitionError = '';
+            if (state.awaitingCommand) armFollowupTimeout(ACTIVE_SPEECH_IDLE_TIMEOUT_MS);
+        };
         recognition.onresult = (event) => {
+            state.restartDelay = 0;
+            state.recognitionFailureCount = 0;
+            state.lastRecognitionError = '';
+            if (state.awaitingCommand) armFollowupTimeout(ACTIVE_SPEECH_IDLE_TIMEOUT_MS);
             for (let index = event.resultIndex; index < event.results.length; index += 1) {
                 const result = event.results[index];
                 const best = selectBestRecognitionCandidate(result);
@@ -530,17 +657,31 @@
             }
         };
         recognition.onerror = (event) => {
-            if (event.error === 'no-speech') state.restartDelay = 0;
+            window.clearTimeout(state.recognitionStartTimer);
+            state.recognitionStartTimer = 0;
+            state.lastRecognitionError = event.error || 'unknown';
+            if (event.error === 'no-speech') {
+                state.restartDelay = 0;
+                if (state.awaitingCommand) {
+                    showOverlay('listening', '아직 듣고 있어요', getBufferedCommand() || '말씀을 기다리는 중입니다.');
+                    armFollowupTimeout(Math.min(state.listeningTimeoutMs, 4000));
+                }
+                return;
+            }
+            if (event.error === 'aborted') return;
             if (['not-allowed', 'service-not-allowed'].includes(event.error)) {
-                state.enabled = false;
-                localStorage.setItem(PREFERENCE_KEY, 'false');
-                setPresence('error', '마이크 권한이 필요합니다');
-                showOverlay('error', '마이크 권한이 필요해요', '브라우저 주소창의 마이크 권한을 허용해 주세요.', { hideAfter: 6500 });
-            } else if (!['no-speech', 'aborted'].includes(event.error)) {
-                setPresence('error', '음성 인식을 다시 연결하고 있습니다');
+                disableVoiceRuntimeWithError('마이크 권한이 필요해요', '브라우저 주소창에서 마이크 권한을 허용한 뒤 다시 눌러 주세요.');
+            } else if (event.error === 'audio-capture') {
+                disableVoiceRuntimeWithError('마이크를 사용할 수 없어요', '다른 앱의 마이크 사용을 끝내거나 입력 장치를 확인해 주세요.');
+            } else if (event.error === 'language-not-supported') {
+                disableVoiceRuntimeWithError('한국어 음성 인식을 지원하지 않아요', 'Chrome 또는 Edge의 최신 버전에서 다시 시도해 주세요.', { unsupported: true });
+            } else {
+                markTransientRecognitionFailure(event.error);
             }
         };
         recognition.onend = () => {
+            window.clearTimeout(state.recognitionStartTimer);
+            state.recognitionStartTimer = 0;
             if (state.recognition === recognition) state.recognition = null;
             if (state.enabled && !state.speaking && document.visibilityState === 'visible') restartRecognition(state.restartDelay);
         };
@@ -550,33 +691,61 @@
     function restartRecognition(delay = 0) {
         window.clearTimeout(state.restartTimer);
         if (!state.enabled || state.speaking || state.recognition || document.visibilityState !== 'visible') return;
+        if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) {
+            disableVoiceRuntimeWithError('음성 호출을 지원하지 않아요', 'Chrome 또는 Edge의 최신 버전을 사용해 주세요.', { unsupported: true });
+            return;
+        }
         state.restartTimer = window.setTimeout(() => {
+            state.restartTimer = 0;
+            if (!state.enabled || state.speaking || state.recognition || document.visibilityState !== 'visible') return;
             const recognition = createRecognition();
             if (!recognition) {
-                state.enabled = false;
-                localStorage.setItem(PREFERENCE_KEY, 'false');
-                setPresence('unsupported', '이 브라우저는 상시 음성 호출을 지원하지 않습니다');
-                showOverlay('error', '음성 호출을 지원하지 않아요', 'Chrome 또는 Edge의 최신 버전을 사용해 주세요.', { hideAfter: 6500 });
+                disableVoiceRuntimeWithError('음성 호출을 지원하지 않아요', 'Chrome 또는 Edge의 최신 버전을 사용해 주세요.', { unsupported: true });
                 return;
             }
             state.recognition = recognition;
-            try { recognition.start(); } catch { state.recognition = null; }
-        }, delay);
+            state.recognitionStartTimer = window.setTimeout(() => {
+                if (state.recognition !== recognition) return;
+                state.recognition = null;
+                recognition.onstart = null;
+                recognition.onspeechstart = null;
+                recognition.onresult = null;
+                recognition.onerror = null;
+                recognition.onend = null;
+                try { recognition.abort(); } catch {}
+                if (markTransientRecognitionFailure('start-timeout')) restartRecognition(state.restartDelay);
+            }, RECOGNITION_START_TIMEOUT_MS);
+            try {
+                recognition.start();
+            } catch (error) {
+                window.clearTimeout(state.recognitionStartTimer);
+                state.recognitionStartTimer = 0;
+                state.recognition = null;
+                if (markTransientRecognitionFailure(error?.name || 'start-failed')) restartRecognition(state.restartDelay);
+            }
+        }, Math.max(0, Number(delay) || 0));
     }
 
     function toggleVoiceRuntime() {
         if (state.enabled) {
             stopRecognition();
-            window.speechSynthesis?.cancel();
+            stopSpeech();
+            window.clearTimeout(state.followupTimer);
+            window.clearTimeout(state.interimTimer);
             state.awaitingCommand = false;
-            state.speaking = false;
             resetCommandBuffer();
             localStorage.setItem(PREFERENCE_KEY, 'false');
             setPresence('off', '헤이 갓플 음성 호출 켜기');
             showOverlay('off', '음성 호출을 껐어요', '작은 표시를 누르면 다시 켤 수 있습니다.', { hideAfter: 3000 });
             return;
         }
+        if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) {
+            disableVoiceRuntimeWithError('음성 호출을 지원하지 않아요', 'Chrome 또는 Edge의 최신 버전을 사용해 주세요.', { unsupported: true });
+            return;
+        }
         state.enabled = true;
+        state.recognitionFailureCount = 0;
+        state.lastRecognitionError = '';
         localStorage.setItem(PREFERENCE_KEY, 'true');
         setPresence('connecting', '마이크 권한을 확인하고 있습니다');
         showOverlay('connecting', '헤이 갓플을 준비하고 있어요', '마이크 권한을 확인합니다.', { hideAfter: 4000 });

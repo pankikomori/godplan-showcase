@@ -6501,7 +6501,11 @@
                 sourceName: typeof input.sourceName === 'string' ? input.sourceName.trim() : '',
                 sourceRefs: Array.isArray(input.sourceRefs) ? input.sourceRefs.filter((item) => typeof item === 'string' && item.trim()).slice(0, 8) : [],
                 confidence: Number.isFinite(Number(input.confidence)) ? Math.max(0, Math.min(100, Math.round(Number(input.confidence)))) : 0
-                ,durationReason: typeof input.durationReason === 'string' ? input.durationReason.trim() : ''
+                ,durationReason: typeof input.durationReason === 'string' ? input.durationReason.trim() : '',
+                ...(typeof input.scheduledDate === 'string' && /^20\d{2}-\d{2}-\d{2}$/.test(input.scheduledDate) ? { scheduledDate: input.scheduledDate } : {}),
+                ...(isValidTimeLabel(input.startTime) ? { startTime: input.startTime } : {}),
+                ...(isValidTimeLabel(input.endTime) ? { endTime: input.endTime } : {}),
+                ...(typeof input.scheduledStart === 'string' && input.scheduledStart.trim() ? { scheduledStart: input.scheduledStart.trim().slice(0, 32) } : {})
             };
         }
 
@@ -6701,7 +6705,15 @@
         let latestDecisionBatch = null;
         let activeAssistantResponseTitle = '';
         let activeAssistantRequestText = '';
-        let activeAssistantRequestContext = { hasAttachment: false, uploadedTaskTexts: [] };
+        let activeAssistantRequestContext = {
+            hasAttachment: false,
+            uploadedTaskTexts: [],
+            appliedUploadCount: 0,
+            successfulFileCount: 0,
+            failedFileCount: 0,
+            reviewFileCount: 0,
+            directlyHandled: false
+        };
         let activeAssistantConditionEnabled = false;
         let proactiveNudgeTimerId = null;
         let assistantLoadingTimerId = null;
@@ -8105,12 +8117,13 @@
             const sourceText = String(extractedText || '').replace(/\r/g, '');
             const taskText = String(task?.text || '').trim();
             const directContext = [taskText, ...(Array.isArray(task?.details) ? task.details : [])].join(' ');
+            const monthPrecisionOnly = /예정\s*월\s*:\s*20\d{2}-\d{2}/u.test(directContext);
             const year = Number(sourceText.match(/20\d{2}/)?.[0]) || new Date().getFullYear();
             let scheduledDate = /^20\d{2}-\d{2}-\d{2}$/.test(String(task?.scheduledDate || ''))
                 ? task.scheduledDate
                 : parseUploadCalendarDate(directContext, year);
 
-            if (!scheduledDate && sourceText && taskText) {
+            if (!scheduledDate && !monthPrecisionOnly && sourceText && taskText) {
                 const taskIndex = sourceText.indexOf(taskText);
                 const precedingText = taskIndex >= 0 ? sourceText.slice(0, taskIndex) : '';
                 const dateMatches = [...precedingText.matchAll(/(?:(20\d{2})[년.\-/]\s*)?(\d{1,2})[월.\-/]\s*(\d{1,2})일?/gu)];
@@ -8118,7 +8131,7 @@
                 scheduledDate = parseUploadCalendarDate(nearestDate, year);
             }
 
-            if (!scheduledDate) {
+            if (!scheduledDate && !monthPrecisionOnly) {
                 const allDates = [...sourceText.matchAll(/(?:(20\d{2})[년.\-/]\s*)?(\d{1,2})[월.\-/]\s*(\d{1,2})일?/gu)]
                     .map((match) => parseUploadCalendarDate(match[0], year))
                     .filter(Boolean);
@@ -8194,13 +8207,63 @@
                         })
                     }; })
                     .filter((entry) => entry.task);
-                const uploadedTasks = parsedTaskEntries
+                const candidateTasks = parsedTaskEntries
                     .map((entry) => entry.task)
                     .filter(Boolean);
+                const autoApplyEligible = parsePayload.autoApplyEligible !== false;
+                const uploadedTasks = autoApplyEligible ? candidateTasks : [];
+                const buildFileContext = (tasks, label) => {
+                    const extractedEvidence = tasks.map((task, index) => {
+                        const details = Array.isArray(task.details) && task.details.length
+                            ? ` | 근거: ${task.details.join(' / ')}`
+                            : '';
+                        const source = task.sourceRefs?.length ? ` | 출처: ${task.sourceRefs.join(' / ')}` : '';
+                        const confidence = task.confidence ? ` | 신뢰도: ${task.confidence}%` : '';
+                        return `${index + 1}. ${task.text}${details}${source}${confidence}`;
+                    }).join('\n');
+                    return [
+                        `[첨부 파일 분석 결과 - ${label}]`,
+                        `분석 방식: ${parsePayload.engine || 'openai'}`,
+                        `요약: ${parsePayload.summary || '요약 없음'}`,
+                        `추출 항목 ${tasks.length}개:`,
+                        extractedEvidence || parsePayload.extractedText || '명확하게 추출된 항목 없음'
+                    ].join('\n');
+                };
 
-                if (!uploadedTasks.length) {
-                    status.textContent = '추출된 작업이 없습니다. 더 선명한 사진 또는 텍스트 파일을 시도해 주세요.';
-                    return null;
+                if (!candidateTasks.length) {
+                    const fileContext = buildFileContext([], '추출 실패');
+                    status.textContent = parsePayload.summary || '신뢰할 수 있는 일정을 추출하지 못했습니다.';
+                    status.classList.remove('has-file');
+                    addAssistantChat('assistant', `첨부 자료 검토 필요: ${parsePayload.summary || '신뢰할 수 있는 일정 항목이 없어 자동 반영하지 않았습니다.'}`);
+                    renderAssistantChat();
+                    return {
+                        summary: parsePayload.summary || '',
+                        uploadedTasks: [],
+                        requestDetails: [instruction, fileContext].filter(Boolean).join('\n\n'),
+                        engine: parsePayload.engine || 'server-fallback',
+                        fileContext,
+                        appliedCount: 0,
+                        processed: false,
+                        requiresReview: true
+                    };
+                }
+
+                if (!autoApplyEligible) {
+                    const fileContext = buildFileContext(candidateTasks, '검토 필요');
+                    status.textContent = `검토 필요: ${candidateTasks.length}개 후보 · 일정에는 아직 반영하지 않음`;
+                    status.classList.remove('has-file');
+                    addAssistantChat('assistant', `첨부 자료에서 ${candidateTasks.length}개 후보를 찾았지만 표 구조가 불명확해 자동 반영하지 않았습니다.`);
+                    renderAssistantChat();
+                    return {
+                        summary: parsePayload.summary || '',
+                        uploadedTasks: [],
+                        requestDetails: [instruction, fileContext].filter(Boolean).join('\n\n'),
+                        engine: parsePayload.engine || 'server-fallback',
+                        fileContext,
+                        appliedCount: 0,
+                        processed: true,
+                        requiresReview: true
+                    };
                 }
 
                 const tasksByDay = parsedTaskEntries.reduce((groups, entry) => {
@@ -8223,10 +8286,16 @@
                     if (!reorderResponse.ok || !reorderPayload.success) {
                         throw new Error(reorderPayload.error || `자동 재정렬 실패 (${reorderResponse.status})`);
                     }
-                    const uploadedDateByText = new Map(tasksByDay[day].map((task) => [task.text.trim(), task]));
+                    const uploadScheduleIdentity = (task) => [
+                        task.scheduledDate || '',
+                        task.startTime || '',
+                        String(task.text || '').trim().toLowerCase(),
+                        String(task.sourceName || '').trim().toLowerCase()
+                    ].join('|');
+                    const uploadedDateByIdentity = new Map(tasksByDay[day].map((task) => [uploadScheduleIdentity(task), task]));
                     plans[day].tasks = (Array.isArray(reorderPayload.reorderedTasks) ? reorderPayload.reorderedTasks : [])
                         .map((task) => {
-                            const uploadedSource = uploadedDateByText.get(String(task.text || '').trim());
+                            const uploadedSource = uploadedDateByIdentity.get(uploadScheduleIdentity(task));
                             return createPlannerTask({
                                 ...task,
                                 scheduledDate: task.scheduledDate || uploadedSource?.scheduledDate || '',
@@ -8251,21 +8320,7 @@
                 }));
                 await persistPlannerState('upload-auto-plan');
 
-                const extractedEvidence = uploadedTasks.map((task, index) => {
-                    const details = Array.isArray(task.details) && task.details.length
-                        ? ` | 근거: ${task.details.join(' / ')}`
-                        : '';
-                    const source = task.sourceRefs?.length ? ` | 출처: ${task.sourceRefs.join(' / ')}` : '';
-                    const confidence = task.confidence ? ` | 신뢰도: ${task.confidence}%` : '';
-                    return `${index + 1}. ${task.text}${details}${source}${confidence}`;
-                }).join('\n');
-                const fileContext = [
-                    '[첨부 파일 분석 결과 - 최우선 근거]',
-                    `분석 방식: ${parsePayload.engine || 'openai'}`,
-                    `요약: ${parsePayload.summary || '요약 없음'}`,
-                    `추출 항목 ${uploadedTasks.length}개:`,
-                    extractedEvidence || parsePayload.extractedText || '명확하게 추출된 항목 없음'
-                ].join('\n');
+                const fileContext = buildFileContext(uploadedTasks, '최우선 근거');
                 const requestDetails = [instruction, fileContext].filter(Boolean).join('\n\n');
 
                 addAssistantChat('assistant', `업로드 자동 추가 완료: ${uploadedTasks.length}개 작업을 ${affectedDays.length}개 요일에 맞춰 반영했습니다.`);
@@ -8279,7 +8334,10 @@
                     uploadedTasks,
                     requestDetails,
                     engine: parsePayload.engine || 'openai',
-                    fileContext
+                    fileContext,
+                    appliedCount: uploadedTasks.length,
+                    processed: true,
+                    requiresReview: false
                 };
             } catch (error) {
                 let localContext = `[첨부 파일명: ${file.name}]`;
@@ -8298,7 +8356,10 @@
                     uploadedTasks: [],
                     requestDetails: [instruction, localContext].filter(Boolean).join('\n\n'),
                     engine: 'local-filename',
-                    fileContext: localContext
+                    fileContext: localContext,
+                    appliedCount: 0,
+                    processed: false,
+                    requiresReview: true
                 };
             }
         }
@@ -12768,7 +12829,9 @@
                 ? '승인 대기'
                 : presentation?.statusBadge === '진행중'
                     ? '처리 중'
-                    : '처리 완료';
+                    : presentation?.statusBadge === '제한'
+                        ? '로컬 처리'
+                        : '처리 완료';
             const context = document.createElement('span');
             const contextProfile = loadAssistantContextProfile();
             const contextLabel = [contextProfile.occupation, contextProfile.workType].filter(Boolean).join(' · ') || '맞춤 프로필';
@@ -12926,10 +12989,17 @@
                 documentCard.appendChild(suggestionCard);
             }
 
-            if (!buildExplicitScheduleCreateFallback(activeAssistantRequestText).length) {
+            const appliedUploadCount = Math.max(0, Number(activeAssistantRequestContext?.appliedUploadCount) || 0);
+            const reviewFileCount = Math.max(0, Number(activeAssistantRequestContext?.reviewFileCount) || 0);
+            if (!activeAssistantRequestContext?.directlyHandled
+                && (appliedUploadCount || reviewFileCount || !buildExplicitScheduleCreateFallback(activeAssistantRequestText).length)) {
             const note = document.createElement('div');
             note.className = 'assistant-response-note';
-            note.textContent = '현재 플래너 상태를 반영한 제안입니다. 아래 실행 카드는 승인할 때만 일정에 반영됩니다.';
+            note.textContent = appliedUploadCount
+                ? `첨부 자료에서 추출한 일정 ${appliedUploadCount}개는 이미 플래너에 반영했습니다. 아래 실행 카드는 추가 변경 제안이며 승인할 때만 더 반영됩니다.`
+                : reviewFileCount
+                    ? `첨부 자료 ${reviewFileCount}개는 구조가 불명확해 자동 반영하지 않았습니다. 내용을 확인한 뒤 다시 요청해 주세요.`
+                    : '현재 플래너 상태를 반영한 제안입니다. 아래 실행 카드는 승인할 때만 일정에 반영됩니다.';
             documentCard.appendChild(note);
             }
             inlineAssistantAnswer.appendChild(documentCard);
@@ -13189,13 +13259,15 @@
             try {
                 const response = await fetch('/api/health', { cache: 'no-store' });
                 const result = await response.json();
-                if (!response.ok || !result.success || !result.aiConfigured) {
-                    throw new Error('AI 서버 설정 필요');
-                }
+                if (!response.ok || !result.success) throw new Error('AI 서버 연결 필요');
                 backendConnected = true;
                 if (canReplaceStatus) {
-                    uploadStatus.textContent = 'AI 서버 연결됨 · 텍스트·이미지·문서·음성 분석 가능';
-                    uploadStatus.classList.add('has-file');
+                    const externalAiReady = result.aiMode === 'external-ready'
+                        && result.aiRuntime?.lastEngine !== 'server-fallback';
+                    uploadStatus.textContent = externalAiReady
+                        ? '외부 AI 키 설정됨 · 텍스트·이미지·문서·음성 분석 준비'
+                        : '로컬 안전 처리 모드 · 일정·텍스트·PDF·OCR 사용 가능 · 생성형 답변 제한';
+                    uploadStatus.classList.remove('has-file');
                 }
                 return true;
             } catch (error) {
@@ -13227,7 +13299,15 @@
             const considerCondition = Boolean(assistantConditionToggle?.checked);
             let requestDetails = submittedInstruction;
             activeAssistantResponseTitle = submittedTitle;
-            activeAssistantRequestContext = { hasAttachment: hasFile, uploadedTaskTexts: [] };
+            activeAssistantRequestContext = {
+                hasAttachment: hasFile,
+                uploadedTaskTexts: [],
+                appliedUploadCount: 0,
+                successfulFileCount: 0,
+                failedFileCount: 0,
+                reviewFileCount: 0,
+                directlyHandled: false
+            };
             activeAssistantConditionEnabled = considerCondition;
             resetAssistantComposeAfterSubmit(submittedInstruction, submittedTitle);
             startAssistantLoading({ hasFile });
@@ -13235,17 +13315,41 @@
                 if (submittedFiles.length) {
                     const fileContexts = [];
                     const uploadedTaskTexts = [];
+                    let appliedUploadCount = 0;
+                    let successfulFileCount = 0;
+                    let failedFileCount = 0;
+                    let reviewFileCount = 0;
                     for (let index = 0; index < submittedFiles.length; index += 1) {
                         const progress = 14 + Math.round(((index + 1) / submittedFiles.length) * 38);
                         setAssistantLoadingProgress(progress, `${index + 1}/${submittedFiles.length} 자료를 읽고 일정으로 바꾸고 있습니다.`);
                         const uploadResult = await uploadFileAndAutoPlan(submittedFiles[index], submittedInstruction);
-                        if (!uploadResult) continue;
+                        if (!uploadResult) {
+                            failedFileCount += 1;
+                            continue;
+                        }
                         if (uploadResult.fileContext) fileContexts.push(uploadResult.fileContext);
                         uploadedTaskTexts.push(...(uploadResult.uploadedTasks || []).map((task) => task.text));
+                        appliedUploadCount += Math.max(0, Number(uploadResult.appliedCount) || 0);
+                        if (uploadResult.processed) successfulFileCount += 1;
+                        else failedFileCount += 1;
+                        if (uploadResult.requiresReview) reviewFileCount += 1;
                     }
                     requestDetails = [submittedInstruction, ...fileContexts].filter(Boolean).join('\n\n');
-                    activeAssistantRequestContext = { hasAttachment: true, uploadedTaskTexts };
-                    setAssistantLoadingProgress(54, `${submittedFiles.length}개 자료를 현재 일정과 연결해 저장했습니다.`);
+                    activeAssistantRequestContext = {
+                        hasAttachment: true,
+                        uploadedTaskTexts,
+                        appliedUploadCount,
+                        successfulFileCount,
+                        failedFileCount,
+                        reviewFileCount,
+                        directlyHandled: false
+                    };
+                    const uploadProgressLabel = appliedUploadCount
+                        ? `${successfulFileCount}개 자료에서 일정 ${appliedUploadCount}개를 반영했습니다.${failedFileCount ? ` · ${failedFileCount}개 실패` : ''}`
+                        : reviewFileCount
+                            ? `${reviewFileCount}개 자료는 검토가 필요해 일정에 자동 반영하지 않았습니다.`
+                            : '첨부 자료에서 신뢰할 수 있는 일정을 추출하지 못했습니다.';
+                    setAssistantLoadingProgress(54, uploadProgressLabel);
                 }
                 await runAssistant(requestDetails, submittedTitle, submittedInstruction, considerCondition);
             } catch (error) {
@@ -14418,7 +14522,11 @@
                     hasAttachment: Boolean(activeAssistantRequestContext.hasAttachment),
                     uploadedTaskTexts: Array.isArray(activeAssistantRequestContext.uploadedTaskTexts)
                         ? activeAssistantRequestContext.uploadedTaskTexts.slice(0, 30)
-                        : []
+                        : [],
+                    appliedUploadCount: Math.max(0, Number(activeAssistantRequestContext.appliedUploadCount) || 0),
+                    successfulFileCount: Math.max(0, Number(activeAssistantRequestContext.successfulFileCount) || 0),
+                    failedFileCount: Math.max(0, Number(activeAssistantRequestContext.failedFileCount) || 0),
+                    reviewFileCount: Math.max(0, Number(activeAssistantRequestContext.reviewFileCount) || 0)
                 },
                 conversationContext: assistantChat.slice(-20).map((item) => ({
                     role: item.role,
@@ -14767,7 +14875,7 @@
             }
         }
 
-        function applyTaskUpdates(taskUpdates) {
+        function applyTaskUpdates(taskUpdates, { announce = true } = {}) {
             if (!taskUpdates.length) return;
 
             for (const update of taskUpdates) {
@@ -14802,14 +14910,16 @@
                     openTimeCheckout(nextTasks, update.day, 'assistant');
                 }
 
-                addAssistantChat(
-                    'assistant',
-                    update.replaceTasks
-                        ? `${DAY_LABEL[update.day]}요일 체크리스트를 요청대로 교체했습니다.${visibleReason ? ` (${visibleReason})` : ''}`
-                        : directCreate
-                            ? `${DAY_LABEL[update.day]}요일에 요청한 일정 ${nextTasks.length}개를 추가했습니다.${visibleReason ? ` (${visibleReason})` : ''}`
-                            : `${DAY_LABEL[update.day]}요일 새 작업을 시간 결제 검토로 보냈습니다. 승인 전에는 기존 일정이 바뀌지 않습니다.${visibleReason ? ` (${visibleReason})` : ''}`
-                );
+                if (announce) {
+                    addAssistantChat(
+                        'assistant',
+                        update.replaceTasks
+                            ? `${DAY_LABEL[update.day]}요일 체크리스트를 요청대로 교체했습니다.${visibleReason ? ` (${visibleReason})` : ''}`
+                            : directCreate
+                                ? `${DAY_LABEL[update.day]}요일에 요청한 일정 ${nextTasks.length}개를 추가했습니다.${visibleReason ? ` (${visibleReason})` : ''}`
+                                : `${DAY_LABEL[update.day]}요일 새 작업을 시간 결제 검토로 보냈습니다. 승인 전에는 기존 일정이 바뀌지 않습니다.${visibleReason ? ` (${visibleReason})` : ''}`
+                    );
+                }
             }
             window.dispatchEvent(new CustomEvent('godplan:planner-updated', {
                 detail: {
@@ -14862,13 +14972,13 @@
             return matches;
         }
 
-        async function executeLightweightPlannerRequest(requestText) {
+        async function executeLightweightPlannerRequest(requestText, { announce = true } = {}) {
             const text = String(requestText || '').replace(/\s+/g, ' ').trim();
             if (!text) return { handled: false };
 
             const createUpdates = buildExplicitScheduleCreateFallback(text);
             if (createUpdates.length) {
-                applyTaskUpdates(createUpdates);
+                applyTaskUpdates(createUpdates, { announce });
                 renderPlan();
                 renderSummary();
                 await persistPlannerState('lightweight-schedule-create');
@@ -14891,7 +15001,12 @@
             const isDelete = /(?:삭제|지워|없애|취소)/u.test(text);
             if (isComplete || isDelete) {
                 const matches = findLightweightTaskMatches(text);
-                if (matches.length !== 1) return { handled: false };
+                if (!matches.length) {
+                    return { handled: true, action: 'clarify', reply: '변경할 일정을 찾지 못했습니다. 일정 이름을 화면에 보이는 제목대로 다시 말씀해 주세요.' };
+                }
+                if (matches.length > 1) {
+                    return { handled: true, action: 'clarify', reply: `같은 이름의 일정이 ${matches.length}개 있습니다. 날짜나 요일을 함께 알려주세요.` };
+                }
                 const match = matches[0];
                 if (isDelete) plans[match.day].tasks.splice(match.index, 1);
                 else match.task.done = true;
@@ -15533,6 +15648,37 @@
             // 사용자 채팅 즉시 UI 출력
             addAssistantChat('user', visibleRequest);
             renderAssistantChat();
+
+            if (!activeAssistantRequestContext?.hasAttachment) {
+                const lightweightResult = await executeLightweightPlannerRequest(visibleDetails || details, { announce: false });
+                if (lightweightResult?.handled) {
+                    activeAssistantRequestContext.directlyHandled = true;
+                    await completeAssistantLoading();
+                    addAssistantChat('assistant', lightweightResult.reply);
+                    showInlineAssistantAnswer(lightweightResult.reply, {
+                        at: new Date().toISOString(),
+                        presentation: {
+                            mode: 'headline_only',
+                            headline: buildAssistantReportTitle(visibleDetails || details),
+                            statusBadge: lightweightResult.action === 'clarify' ? '대기' : '완료',
+                            executiveSummary: []
+                        }
+                    });
+                    latestInlineRecommendations = [];
+                    inlineActionCards.innerHTML = '';
+                    renderPlan();
+                    renderSummary();
+                    renderAssistantChat();
+                    recordExecutionTwinEvent('assistant-response', {
+                        feature: 'capture',
+                        count: 0,
+                        taskText: (visibleDetails || details).slice(0, 180)
+                    });
+                    awardPoints(5, '요청 처리');
+                    await persistPlannerState('assistant-lightweight-response');
+                    return;
+                }
+            }
 
             if (currentMode === 'worker') {
                 const calendarConfig = readCalendarConfigFromUI();
