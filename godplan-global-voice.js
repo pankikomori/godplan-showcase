@@ -821,13 +821,27 @@
                 restartRecognition(0);
             }
         });
-        if (localStorage.getItem(AUTO_ENABLE_KEY) !== 'done') {
+        const speechRecognitionSupported = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+        localStorage.setItem(AUTO_ENABLE_KEY, 'done');
+        state.enabled = speechRecognitionSupported;
+        if (speechRecognitionSupported) {
             localStorage.setItem(PREFERENCE_KEY, 'true');
-            localStorage.setItem(AUTO_ENABLE_KEY, 'done');
+            setPresence('connecting', '헤이 갓플 음성 호출 연결 중');
+            restartRecognition(0);
+            window.addEventListener('load', () => {
+                if (state.enabled) restartRecognition(0);
+            }, { once: true });
+            window.addEventListener('pageshow', () => {
+                state.enabled = true;
+                localStorage.setItem(PREFERENCE_KEY, 'true');
+                restartRecognition(0);
+            });
+            window.addEventListener('focus', () => {
+                if (state.enabled) restartRecognition(0);
+            });
+        } else {
+            setPresence('unsupported', '이 브라우저는 헤이 갓플 음성 호출을 지원하지 않습니다');
         }
-        state.enabled = localStorage.getItem(PREFERENCE_KEY) === 'true';
-        setPresence(state.enabled ? 'connecting' : 'off', state.enabled ? '헤이 갓플 음성 호출 연결 중' : '헤이 갓플 음성 호출 켜기');
-        if (state.enabled) restartRecognition(0);
         window.godPlanGlobalVoice = {
             simulateTranscript: (text) => handleTranscript(text, true),
             matchWakePhrase: (text) => ({ ...findWakePhrase(text) }),
