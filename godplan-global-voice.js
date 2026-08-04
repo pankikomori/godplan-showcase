@@ -586,7 +586,7 @@
     function disableVoiceRuntimeWithError(title, message, options = {}) {
         state.enabled = false;
         state.openOnRecognitionStart = false;
-        localStorage.setItem(PREFERENCE_KEY, 'false');
+        if (options.persistDisabled) localStorage.setItem(PREFERENCE_KEY, 'false');
         stopRecognition({ preserveEnabled: true });
         stopSpeech();
         window.clearTimeout(state.followupTimer);
@@ -595,6 +595,26 @@
         resetCommandBuffer();
         setPresence(options.unsupported ? 'unsupported' : 'error', message);
         showOverlay('error', title, message, { hideAfter: options.hideAfter || 6500 });
+    }
+
+    async function watchMicrophonePermission() {
+        const permissions = window.navigator?.permissions;
+        if (!permissions?.query) return;
+        try {
+            const permission = await permissions.query({ name: 'microphone' });
+            const resumeWhenGranted = () => {
+                if (permission.state !== 'granted') return;
+                if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) return;
+                state.enabled = true;
+                state.recognitionFailureCount = 0;
+                state.lastRecognitionError = '';
+                localStorage.setItem(PREFERENCE_KEY, 'true');
+                setPresence('connecting', '마이크 권한 확인 완료 · 헤이 갓플 연결 중');
+                restartRecognition(0);
+            };
+            permission.addEventListener?.('change', resumeWhenGranted);
+            resumeWhenGranted();
+        } catch {}
     }
 
     function markTransientRecognitionFailure(error) {
@@ -814,6 +834,7 @@
         if (document.getElementById('godplan-global-voice-presence')) return;
         createInterface();
         wrapAssistantFetch();
+        void watchMicrophonePermission();
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'hidden') {
                 stopRecognition({ preserveEnabled: true });
